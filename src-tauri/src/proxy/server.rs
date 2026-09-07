@@ -363,7 +363,8 @@ impl ProxyServer {
                 "/codex/v1/alpha/search",
                 post(handlers::handle_alpha_search),
             )
-            // Codex built-in ImageGen still calls the legacy OpenAI Images API.
+            // Codex built-in ImageGen still calls the legacy OpenAI Images API:
+            // generations for new images, edits when the call references images.
             .route(
                 "/images/generations",
                 post(handlers::handle_images_generations),
@@ -379,6 +380,13 @@ impl ProxyServer {
             .route(
                 "/codex/v1/images/generations",
                 post(handlers::handle_images_generations),
+            )
+            .route("/images/edits", post(handlers::handle_images_edits))
+            .route("/v1/images/edits", post(handlers::handle_images_edits))
+            .route("/v1/v1/images/edits", post(handlers::handle_images_edits))
+            .route(
+                "/codex/v1/images/edits",
+                post(handlers::handle_images_edits),
             )
             // Gemini API (支持带前缀和不带前缀)
             //
@@ -448,9 +456,38 @@ mod tests {
 
     #[tokio::test]
     async fn codex_images_generation_aliases_forward_and_record_usage() {
+        assert_codex_images_aliases_forward_and_record_usage("/images/generations", None).await;
+    }
+
+    #[tokio::test]
+    async fn codex_images_edit_aliases_forward_and_record_usage() {
+        assert_codex_images_aliases_forward_and_record_usage(
+            "/images/edits",
+            Some(json!([{"image_url": "data:image/png;base64,aW1hZ2U="}])),
+        )
+        .await;
+    }
+
+    fn images_request_body(prompt: &str, images: Option<&Value>) -> Value {
+        let mut body = json!({"model": "gpt-image-1", "prompt": prompt});
+        if let Some(images) = images {
+            body["images"] = images.clone();
+        }
+        body
+    }
+
+    /// Codex's legacy Images API endpoints share one contract: every local alias
+    /// reaches the same canonical upstream path with the selected provider's
+    /// credentials, Images usage is recorded, and a full-URL provider is rewritten
+    /// to the sibling Images endpoint instead of reusing its configured URL.
+    async fn assert_codex_images_aliases_forward_and_record_usage(
+        canonical_endpoint: &str,
+        images: Option<Value>,
+    ) {
+        let upstream_path = format!("/v1{canonical_endpoint}");
         let captured = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
         let mock_app = Router::new().route(
-            "/v1/images/generations",
+            &upstream_path,
             post({
                 let captured = captured.clone();
                 move |request: axum::extract::Request| {
@@ -521,10 +558,10 @@ mod tests {
         let proxy_info = proxy.start().await.expect("start test proxy");
         let client = reqwest::Client::new();
         let aliases = [
-            "/images/generations",
-            "/v1/images/generations",
-            "/v1/v1/images/generations",
-            "/codex/v1/images/generations",
+            canonical_endpoint.to_string(),
+            format!("/v1{canonical_endpoint}"),
+            format!("/v1/v1{canonical_endpoint}"),
+            format!("/codex/v1{canonical_endpoint}"),
         ];
 
         for (index, path) in aliases.iter().enumerate() {
@@ -534,10 +571,10 @@ mod tests {
                     proxy_info.port, path
                 ))
                 .header(header::AUTHORIZATION, "Bearer client-secret")
-                .json(&json!({
-                    "model": "gpt-image-1",
-                    "prompt": format!("image generation alias {index}")
-                }))
+                .json(&images_request_body(
+                    &format!("images alias {index}"),
+                    images.as_ref(),
+                ))
                 .send()
                 .await
                 .expect("send images request");
@@ -599,14 +636,11 @@ mod tests {
 
         let response = client
             .post(format!(
-                "http://127.0.0.1:{}/v1/images/generations?client_version=0.145.0",
+                "http://127.0.0.1:{}{upstream_path}?client_version=0.145.0",
                 proxy_info.port
             ))
             .header(header::AUTHORIZATION, "Bearer client-secret")
-            .json(&json!({
-                "model": "gpt-image-1",
-                "prompt": "image generation full URL"
-            }))
+            .json(&images_request_body("images full URL", images.as_ref()))
             .send()
             .await
             .expect("send full URL images request");
@@ -622,30 +656,29 @@ mod tests {
         for (index, request) in captured.iter().take(aliases.len()).enumerate() {
             assert_eq!(
                 request.path_and_query,
-                "/v1/images/generations?client_version=0.145.0"
+                format!("{upstream_path}?client_version=0.145.0")
             );
             assert_eq!(
                 request.authorization.as_deref(),
                 Some("Bearer upstream-secret")
             );
             assert_eq!(request.body["model"], "gpt-image-1");
-            assert_eq!(
-                request.body["prompt"],
-                format!("image generation alias {index}")
-            );
+            assert_eq!(request.body["prompt"], format!("images alias {index}"));
+            assert_eq!(request.body.get("images"), images.as_ref());
         }
 
         let full_url_request = captured.last().expect("full URL image request captured");
         assert_eq!(
             full_url_request.path_and_query,
-            "/v1/images/generations?api-version=test&client_version=0.145.0"
+            format!("{upstream_path}?api-version=test&client_version=0.145.0")
         );
         assert_eq!(
             full_url_request.authorization.as_deref(),
             Some("Bearer full-url-secret")
         );
         assert_eq!(full_url_request.body["model"], "gpt-image-1");
-        assert_eq!(full_url_request.body["prompt"], "image generation full URL");
+        assert_eq!(full_url_request.body["prompt"], "images full URL");
+        assert_eq!(full_url_request.body.get("images"), images.as_ref());
 
         proxy.stop().await.expect("stop test proxy");
         mock_handle.abort();

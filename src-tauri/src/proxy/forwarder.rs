@@ -1501,6 +1501,13 @@ impl RequestForwarder {
             } else {
                 append_query_to_full_url(&base_url, passthrough_query.as_deref())
             }
+        } else if let Some(endpoint) = codex_standalone_endpoint
+            .filter(|endpoint| endpoint.base_url_is_source_endpoint(&base_url))
+        {
+            // Same tolerance as `codex_chat_base_is_full_endpoint` below: a base URL
+            // pasted as a complete endpoint with the full-URL switch off would
+            // otherwise become `.../chat/completions/images/generations`.
+            rewrite_codex_standalone_full_url(&base_url, passthrough_query.as_deref(), endpoint)?
         } else if codex_chat_base_is_full_endpoint || codex_anthropic_base_is_full_endpoint {
             append_query_to_full_url(&base_url, passthrough_query.as_deref())
         } else {
@@ -3374,6 +3381,14 @@ impl CodexStandaloneEndpoint {
             .iter()
             .copied()
             .find(|suffix| parsed_path.ends_with(suffix))
+    }
+
+    /// Whether a base URL (full-URL switch off) already ends in one of this
+    /// endpoint's source suffixes, i.e. was pasted as a complete endpoint URL.
+    fn base_url_is_source_endpoint(self, base_url: &str) -> bool {
+        self.source_suffixes()
+            .iter()
+            .any(|suffix| base_url_is_full_endpoint(base_url, suffix))
     }
 }
 
